@@ -342,14 +342,19 @@
 import {
   AutoTokenizer,
   AutoModelForCausalLM,
-  Tensor
+  Tensor,
+  env
 } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3";
+
+// Ensure browser Cache API is enabled so model files are cached across page refreshes
+env.useBrowserCache = true;
 
 
 /* ── Global state ── */
-let tokenizer  = null;   // loaded on first click
-let model      = null;   // loaded on first click
-let modelReady = false;  // flag so we only load once
+let tokenizer   = null;      // cached in memory once loaded
+let model       = null;      // cached in memory once loaded
+let modelReady  = false;     // flag so we only load once per session
+let loadPromise = null;      // singleton promise to prevent concurrent loading calls
 
 
 /* ── Grab DOM elements we'll use repeatedly ── */
@@ -390,32 +395,66 @@ function softmax(arr) {
    ═══════════════════════════════════════════════ */
 async function ensureModel() {
   if (modelReady) return;
+  if (loadPromise) return loadPromise;
 
-  setStatus("Downloading the model… (≈80 MB, first time only)", "loading");
   calcBtn.disabled = true;
 
+  // Check if model files are already cached in browser CacheStorage
+  let isCached = false;
   try {
-    // Download both in parallel to save time
-    [tokenizer, model] = await Promise.all([
-      AutoTokenizer.from_pretrained("Xenova/distilgpt2"),
-      AutoModelForCausalLM.from_pretrained("Xenova/distilgpt2", {
-        dtype: "q8"           // 8-bit quantised — smaller & faster
-      })
-    ]);
-    modelReady = true;
-    setStatus("Model ready ✓", "ready");
-  } catch (err) {
-    // Show a clear red error if the download fails
-    setStatus("", "");
-    sec2.classList.remove("hidden");
-    sec2.querySelector("h2").insertAdjacentHTML(
-      "afterend",
-      `<div class="error-box">⚠️ Failed to load model: ${escHtml(err.message)}</div>`
-    );
-    throw err;
-  } finally {
-    calcBtn.disabled = false;
+    if (window.caches) {
+      const cache = await caches.open("transformers-cache");
+      const keys = await cache.keys();
+      // Check if any Xenova/distilgpt2 onnx or weight file exists in cache
+      isCached = keys.some(req => req.url.includes("distilgpt2"));
+    }
+  } catch (e) {
+    // If CacheStorage inspection fails, proceed normally
   }
+
+  if (isCached) {
+    setStatus("Loading model from browser cache…", "loading");
+  } else {
+    setStatus("Downloading the model… (≈80 MB, first time only)", "loading");
+  }
+
+  loadPromise = (async () => {
+    try {
+      const progressCallback = (info) => {
+        if (info.status === "progress" && typeof info.progress === "number") {
+          const pct = Math.round(info.progress);
+          setStatus(`Downloading model… ${pct}% (≈80 MB, first time only)`, "loading");
+        } else if (info.status === "done") {
+          setStatus("Initializing model in browser…", "loading");
+        }
+      };
+
+      // Load tokenizer and model
+      [tokenizer, model] = await Promise.all([
+        AutoTokenizer.from_pretrained("Xenova/distilgpt2"),
+        AutoModelForCausalLM.from_pretrained("Xenova/distilgpt2", {
+          dtype: "q8",
+          progress_callback: progressCallback
+        })
+      ]);
+
+      modelReady = true;
+      setStatus("Model ready ✓", "ready");
+    } catch (err) {
+      loadPromise = null;
+      setStatus("", "");
+      sec2.classList.remove("hidden");
+      sec2.querySelector("h2").insertAdjacentHTML(
+        "afterend",
+        `<div class="error-box">⚠️ Failed to load model: ${escHtml(err.message)}</div>`
+      );
+      throw err;
+    } finally {
+      calcBtn.disabled = false;
+    }
+  })();
+
+  return loadPromise;
 }
 
 
